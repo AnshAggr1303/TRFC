@@ -1,0 +1,15 @@
+{
+  "name": "trfc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TRFC Multi-Shop Business Management System",
+  "scripts": {
+    "dev": "pnpm --filter @trfc/frontend dev",
+    "build": "pnpm --filter @trfc/frontend build",
+    "lint": "pnpm --filter @trfc/frontend lint",
+    "typecheck": "pnpm --filter @trfc/frontend typecheck"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
