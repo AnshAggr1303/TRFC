@@ -2,12 +2,17 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { createClient } from '@/lib/supabase/client';
-import type { ShopOption } from '@/types/daily-closing';
 import type { Database } from '@/types/database.types';
 
-// Explicit types from database
+// Define types locally (no more dependency on deleted file)
 type Shop = Database['public']['Tables']['shops']['Row'];
 type DailySalesLog = Database['public']['Tables']['daily_sales_logs']['Row'];
+
+export interface ShopOption {
+  id: string;
+  name: string;
+  code: string;
+}
 
 export function useShops() {
   const supabase = createClient();
@@ -50,7 +55,6 @@ export function useOpeningCash(shopId: string, date: string) {
       
       if (error) throw error;
       
-      // Return first result's actual_closing or 0
       return data?.[0]?.actual_closing ?? 0;
     },
     enabled: !!shopId && !!date,

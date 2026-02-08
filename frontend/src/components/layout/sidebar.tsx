@@ -12,6 +12,7 @@ import {
   BarChart3,
   Settings,
   LogOut,
+  ClipboardList,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -28,7 +29,7 @@ interface SidebarProps {
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
-  { name: 'Daily Closing', href: '/daily-closing', icon: Receipt },
+  { name: 'Daily Register', href: '/daily-register', icon: ClipboardList },
   { name: 'Inventory', href: '/inventory', icon: Package },
   { name: 'Expenses', href: '/expenses', icon: DollarSign },
   { name: 'Employees', href: '/employees', icon: Users },
