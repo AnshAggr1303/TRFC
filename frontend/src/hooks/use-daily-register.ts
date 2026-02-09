@@ -1,3 +1,4 @@
+// src/hooks/use-daily-register.ts
 'use client';
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -5,13 +6,6 @@ import { createClient } from '@/lib/supabase/client';
 import type { Database } from '@/types/database.types';
 import type { DailyRegisterData, ExpenseRow, SalesRow } from '@/types/daily-register';
 import { createEmptyRegisterData } from '@/types/daily-register';
-
-// Define explicit types from database
-type DailySalesLog = Database['public']['Tables']['daily_sales_logs']['Row'];
-type DailySalesLogInsert = Database['public']['Tables']['daily_sales_logs']['Insert'];
-type SalesEntryInsert = Database['public']['Tables']['sales_entries']['Insert'];
-type ExpenseInsert = Database['public']['Tables']['expenses']['Insert'];
-type ActivityLogInsert = Database['public']['Tables']['activity_logs']['Insert'];
 
 // ============================================
 // FETCH DAILY REGISTER (with related data)
@@ -24,28 +18,28 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
     queryKey: ['daily-register', shopId, logDate],
     queryFn: async (): Promise<DailyRegisterData> => {
       // 1. Try to fetch existing log
-      const { data: logData, error: logError } = await supabase
+      const { data: logDataArray, error: logError } = await supabase
         .from('daily_sales_logs')
         .select('*')
         .eq('shop_id', shopId)
         .eq('log_date', logDate)
-        .returns<DailySalesLog[]>();
+        .returns<Database['public']['Tables']['daily_sales_logs']['Row'][]>();
 
       if (logError) throw logError;
 
-      const existingLog = logData?.[0] || null;
+      const existingLog = logDataArray?.[0] || null;
 
       // 2. Fetch opening cash (previous day's closing)
-      const { data: prevLogData } = await supabase
+      const { data: prevLogArray } = await supabase
         .from('daily_sales_logs')
         .select('actual_closing')
         .eq('shop_id', shopId)
         .lt('log_date', logDate)
         .order('log_date', { ascending: false })
         .limit(1)
-        .returns<Pick<DailySalesLog, 'actual_closing'>[]>();
+        .returns<{ actual_closing: number | null }[]>();
 
-      const openingCash = prevLogData?.[0]?.actual_closing ?? 0;
+      const openingCash = prevLogArray?.[0]?.actual_closing ?? 0;
 
       // 3. If no existing log, return empty data with opening cash
       if (!existingLog) {
@@ -56,21 +50,49 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
       }
 
       // 4. Fetch sales entries for this log
+      type SalesEntryWithMethod = {
+        id: string;
+        payment_method_id: string;
+        gross_amount: number;
+        returns_amount: number;
+        net_amount: number;
+        is_cash: boolean;
+        method_type: string;
+        payment_methods: { name: string } | null;
+      };
+
       const { data: salesData, error: salesError } = await supabase
         .from('sales_entries')
-        .select('id, payment_method_id, gross_amount, returns_amount, net_amount, payment_methods(name, method_type)')
+        .select('id, payment_method_id, gross_amount, returns_amount, net_amount, is_cash, method_type, payment_methods(name)')
         .eq('daily_log_id', existingLog.id)
-        .order('created_at', { ascending: true });
+        .order('created_at', { ascending: true })
+        .returns<SalesEntryWithMethod[]>();
 
       if (salesError) throw salesError;
 
-      // 5. Fetch expenses for this shop/date
+      // 5. Fetch expenses for this daily log
+      type ExpenseWithPayments = {
+        id: string;
+        description: string;
+        amount: number;
+        category_id: string | null;
+        vendor_id: string | null;
+        expense_payments: { is_cash: boolean; amount: number }[];
+      };
+
       const { data: expensesData, error: expensesError } = await supabase
         .from('expenses')
-        .select('id, description, amount, paid_via, category_id, vendor_id')
-        .eq('shop_id', shopId)
-        .eq('expense_date', logDate)
-        .order('created_at', { ascending: true });
+        .select(`
+          id, 
+          description, 
+          amount, 
+          category_id, 
+          vendor_id,
+          expense_payments(is_cash, amount)
+        `)
+        .eq('daily_log_id', existingLog.id)
+        .order('created_at', { ascending: true })
+        .returns<ExpenseWithPayments[]>();
 
       if (expensesError) throw expensesError;
 
@@ -85,45 +107,48 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
 
       // Map database sales entries to our structure
       if (salesData) {
-        salesData.forEach((entry: any) => {
-          const methodName = entry.payment_methods?.name?.toLowerCase() || '';
-          const methodType = entry.payment_methods?.method_type || '';
+        for (const entry of salesData) {
+          const methodName = (entry.payment_methods?.name || '').toLowerCase();
+          const methodType = entry.method_type || '';
           
           let targetId = 'other';
-          if (methodName.includes('cash') || methodType === 'cash') targetId = 'cash';
-          else if (methodName.includes('upi')) targetId = 'upi';
-          else if (methodName.includes('swiggy')) targetId = 'swiggy';
-          else if (methodName.includes('zomato')) targetId = 'zomato';
+          if (entry.is_cash || methodType === 'cash') targetId = 'cash';
+          else if (methodName.includes('upi') || methodType === 'upi') targetId = 'upi';
+          else if (methodName.includes('swiggy') || methodType === 'aggregator_swiggy') targetId = 'swiggy';
+          else if (methodName.includes('zomato') || methodType === 'aggregator_zomato') targetId = 'zomato';
 
           const salesRow = sales.find(s => s.id === targetId);
           if (salesRow) {
             salesRow.amount += entry.net_amount || 0;
             salesRow.paymentMethodId = entry.payment_method_id;
           }
-        });
+        }
       }
 
-      // 7. Build expense rows
+      // 7. Build expense rows - determine cash vs online from expense_payments
       const cashExpenses: ExpenseRow[] = [];
       const onlineExpenses: ExpenseRow[] = [];
 
       if (expensesData) {
-        expensesData.forEach((exp: any) => {
+        for (const exp of expensesData) {
+          const payments = exp.expense_payments || [];
+          const isCash = payments.length === 0 || payments.some(p => p.is_cash);
+          
           const row: ExpenseRow = {
             id: exp.id,
             description: exp.description || '',
             amount: exp.amount || 0,
-            isCash: exp.paid_via === 'cash',
+            isCash,
             categoryId: exp.category_id || undefined,
             vendorId: exp.vendor_id || undefined,
           };
 
-          if (exp.paid_via === 'cash') {
+          if (isCash) {
             cashExpenses.push(row);
           } else {
             onlineExpenses.push(row);
           }
-        });
+        }
       }
 
       // 8. Calculate totals
@@ -143,7 +168,7 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
         shopCode,
         shopName,
         logDate,
-        status: (existingLog.status as DailyRegisterData['status']) || 'draft',
+        status: existingLog.status || 'draft',
 
         sales,
         totalSales,
@@ -181,6 +206,11 @@ interface SaveResult {
   message: string;
 }
 
+// Profile type for the query
+interface ProfileWithOrg {
+  org_id: string | null;
+}
+
 export function useSaveDailyRegister() {
   const supabase = createClient();
   const queryClient = useQueryClient();
@@ -192,18 +222,21 @@ export function useSaveDailyRegister() {
       const user = authData?.user;
       if (!user) throw new Error('Not authenticated');
 
-      // Get user's org_id from profile
-      const { data: profileData } = await supabase
+      // Get user's org_id from profile - use explicit typing
+      const { data: profileData, error: profileError } = await supabase
         .from('profiles')
         .select('org_id')
         .eq('id', user.id)
-        .single();
+        .single<ProfileWithOrg>();
 
+      if (profileError) throw profileError;
       if (!profileData?.org_id) throw new Error('User has no organization');
 
       const orgId = profileData.org_id;
 
       // 1. Upsert daily_sales_logs
+      type DailySalesLogInsert = Database['public']['Tables']['daily_sales_logs']['Insert'];
+      
       const logPayload: DailySalesLogInsert = {
         org_id: orgId,
         shop_id: data.shopId,
@@ -212,7 +245,8 @@ export function useSaveDailyRegister() {
         gross_sales: data.totalSales,
         net_sales: data.totalSales,
         cash_sales: data.cashRecon.todaysCash,
-        total_expenses: data.totalExpenses,
+        total_cash_expenses: data.totalCashExpenses,
+        total_online_expenses: data.totalOnlineExpenses,
         expected_closing: data.cashRecon.expectedCash,
         actual_closing: data.cashRecon.actualCash,
         variance: data.cashRecon.difference,
@@ -221,150 +255,231 @@ export function useSaveDailyRegister() {
         logged_by: user.id,
       };
 
-      let logId = data.id;
+      let logId: string;
 
-      if (logId) {
+      if (data.id) {
         // Update existing
-        const { error } = await supabase
-          .from('daily_sales_logs')
+        logId = data.id;
+        const { error } = await (supabase.from('daily_sales_logs') as any)
           .update(logPayload)
           .eq('id', logId);
 
         if (error) throw error;
       } else {
         // Insert new
-        const { data: newLogData, error } = await supabase
-          .from('daily_sales_logs')
+        const { data: newLogData, error } = await (supabase.from('daily_sales_logs') as any)
           .insert(logPayload)
           .select('id')
           .single();
 
         if (error) throw error;
         if (!newLogData) throw new Error('Failed to create log');
-        logId = newLogData.id;
+        logId = (newLogData as any).id;
       }
 
       // 2. Delete existing sales entries and re-insert
-      if (logId) {
-        await supabase
-          .from('sales_entries')
-          .delete()
-          .eq('daily_log_id', logId);
-      }
+      await supabase
+        .from('sales_entries')
+        .delete()
+        .eq('daily_log_id', logId);
 
-      // Fetch payment method IDs
+      // Fetch payment methods to get IDs and method_types
+      type PaymentMethodRow = { id: string; name: string; method_type: string };
       const { data: paymentMethods } = await supabase
         .from('payment_methods')
         .select('id, name, method_type')
-        .eq('is_active', true);
+        .eq('is_active', true)
+        .returns<PaymentMethodRow[]>();
 
-      const getPaymentMethodId = (source: string): string | null => {
-        if (!paymentMethods) return null;
-        const pm = paymentMethods.find((p: any) => 
-          p.name.toLowerCase().includes(source.toLowerCase()) ||
-          (source === 'Cash' && p.method_type === 'cash')
+      const getPaymentMethodInfo = (source: string): { id: string | null; methodType: string; isCash: boolean } => {
+        if (!paymentMethods) return { id: null, methodType: 'cash', isCash: true };
+        
+        const sourceLower = source.toLowerCase();
+        const pm = paymentMethods.find(p => 
+          p.name.toLowerCase().includes(sourceLower) ||
+          (sourceLower === 'cash' && p.method_type === 'cash')
         );
-        return pm?.id || null;
+        
+        if (!pm) {
+          if (sourceLower === 'cash') return { id: null, methodType: 'cash', isCash: true };
+          if (sourceLower === 'upi') return { id: null, methodType: 'upi', isCash: false };
+          if (sourceLower === 'swiggy') return { id: null, methodType: 'aggregator_swiggy', isCash: false };
+          if (sourceLower === 'zomato') return { id: null, methodType: 'aggregator_zomato', isCash: false };
+          return { id: null, methodType: 'online', isCash: false };
+        }
+        
+        return { 
+          id: pm.id, 
+          methodType: pm.method_type,
+          isCash: pm.method_type === 'cash'
+        };
       };
 
-      // Insert sales entries (only non-zero)
-      const salesEntries: SalesEntryInsert[] = data.sales
-        .filter(s => s.amount > 0)
-        .map(s => ({
-          org_id: orgId,
-          daily_log_id: logId!,
-          payment_method_id: getPaymentMethodId(s.source),
-          gross_amount: s.amount,
-          returns_amount: 0,
-          net_amount: s.amount,
-        }));
-
-      if (salesEntries.length > 0) {
-        const { error: salesError } = await supabase
-          .from('sales_entries')
-          .insert(salesEntries);
-
-        if (salesError) throw salesError;
+      // Insert sales entries (only non-zero with valid payment method)
+      for (const s of data.sales) {
+        if (s.amount <= 0) continue;
+        
+        const pmInfo = getPaymentMethodInfo(s.source);
+        const paymentMethodId = pmInfo.id || s.paymentMethodId;
+        
+        if (!paymentMethodId) {
+          console.warn(`No payment method found for ${s.source}, skipping`);
+          continue;
+        }
+        
+        await (supabase.from('sales_entries') as any)
+          .insert({
+            daily_log_id: logId,
+            entry_date: data.logDate,
+            payment_method_id: paymentMethodId,
+            method_type: pmInfo.methodType,
+            is_cash: pmInfo.isCash,
+            gross_amount: s.amount,
+            returns_amount: 0,
+            net_amount: s.amount,
+          });
       }
 
       // 3. Handle expenses - delete old and insert new
+      const { data: existingExpenses } = await supabase
+        .from('expenses')
+        .select('id')
+        .eq('daily_log_id', logId)
+        .returns<{ id: string }[]>();
+      
+      if (existingExpenses && existingExpenses.length > 0) {
+        for (const exp of existingExpenses) {
+          await supabase
+            .from('expense_payments')
+            .delete()
+            .eq('expense_id', exp.id);
+        }
+      }
+
+      // Delete expenses linked to this daily log
       await supabase
         .from('expenses')
         .delete()
-        .eq('shop_id', data.shopId)
-        .eq('expense_date', data.logDate)
-        .eq('logged_by', user.id);
+        .eq('daily_log_id', logId);
 
       // Get default expense category
       const { data: categories } = await supabase
         .from('expense_categories')
         .select('id')
         .eq('org_id', orgId)
-        .limit(1);
+        .eq('is_active', true)
+        .limit(1)
+        .returns<{ id: string }[]>();
 
-      const defaultCategoryId = categories?.[0]?.id || null;
+      const defaultCategoryId = categories?.[0]?.id;
 
-      // Prepare expenses
-      const cashExpensesToInsert: ExpenseInsert[] = data.cashExpenses
-        .filter(e => e.description && e.amount > 0)
-        .map(e => ({
-          org_id: orgId,
-          shop_id: data.shopId,
-          expense_date: data.logDate,
-          category_id: e.categoryId || defaultCategoryId,
-          description: e.description,
-          amount: e.amount,
-          paid_via: 'cash' as const,
-          logged_by: user.id,
-        }));
+      // Get default payment methods for cash and bank
+      const { data: cashPM } = await supabase
+        .from('payment_methods')
+        .select('id')
+        .eq('org_id', orgId)
+        .eq('method_type', 'cash')
+        .eq('for_expenses', true)
+        .limit(1)
+        .returns<{ id: string }[]>();
 
-      const onlineExpensesToInsert: ExpenseInsert[] = data.onlineExpenses
-        .filter(e => e.description && e.amount > 0)
-        .map(e => ({
-          org_id: orgId,
-          shop_id: data.shopId,
-          expense_date: data.logDate,
-          category_id: e.categoryId || defaultCategoryId,
-          description: e.description,
-          amount: e.amount,
-          paid_via: 'bank' as const,
-          logged_by: user.id,
-        }));
+      const { data: bankPM } = await supabase
+        .from('payment_methods')
+        .select('id')
+        .eq('org_id', orgId)
+        .eq('method_type', 'bank')
+        .eq('for_expenses', true)
+        .limit(1)
+        .returns<{ id: string }[]>();
 
-      const allExpenses = [...cashExpensesToInsert, ...onlineExpensesToInsert];
+      const cashPaymentMethodId = cashPM?.[0]?.id;
+      const bankPaymentMethodId = bankPM?.[0]?.id;
 
-      if (allExpenses.length > 0) {
-        const { error: expError } = await supabase
-          .from('expenses')
-          .insert(allExpenses);
+      // Helper to create expense with payment
+      const createExpenseWithPayment = async (expense: ExpenseRow, isCash: boolean) => {
+        if (!expense.description || expense.amount <= 0) return;
+        if (!defaultCategoryId) {
+          console.warn('No default expense category, skipping expense');
+          return;
+        }
 
-        if (expError) throw expError;
-      }
+        const { data: newExpenseData, error: expError } = await (supabase.from('expenses') as any)
+          .insert({
+            org_id: orgId,
+            shop_id: data.shopId,
+            daily_log_id: logId,
+            expense_date: data.logDate,
+            category_id: expense.categoryId || defaultCategoryId,
+            description: expense.description,
+            amount: expense.amount,
+            payment_status: 'paid',
+            created_by: user.id,
+          })
+          .select('id')
+          .single();
 
-      // 4. Log activity
-      const activityPayload: ActivityLogInsert = {
-        org_id: orgId,
-        user_id: user.id,
-        action: data.id ? 'update' : 'create',
-        entity_type: 'daily_sales_log',
-        entity_id: logId!,
-        description: `Daily register ${data.id ? 'updated' : 'created'} for ${data.shopCode} on ${data.logDate}`,
-        metadata: {
-          total_sales: data.totalSales,
-          total_expenses: data.totalExpenses,
-          variance: data.cashRecon.difference,
-        },
+        if (expError) {
+          console.error('Expense error:', expError);
+          throw expError;
+        }
+
+        const newExpenseId = (newExpenseData as any)?.id;
+        const paymentMethodId = isCash ? cashPaymentMethodId : bankPaymentMethodId;
+        
+        if (newExpenseId && paymentMethodId) {
+          const { error: payError } = await (supabase.from('expense_payments') as any)
+            .insert({
+              expense_id: newExpenseId,
+              payment_method_id: paymentMethodId,
+              method_type: isCash ? 'cash' : 'bank',
+              is_cash: isCash,
+              amount: expense.amount,
+              payment_date: data.logDate,
+            });
+
+          if (payError) {
+            console.error('Payment error:', payError);
+          }
+        }
       };
 
-      await supabase.from('activity_logs').insert(activityPayload);
+      // Create cash expenses
+      for (const expense of data.cashExpenses) {
+        await createExpenseWithPayment(expense, true);
+      }
+
+      // Create online expenses
+      for (const expense of data.onlineExpenses) {
+        await createExpenseWithPayment(expense, false);
+      }
+
+      // 4. Log activity (skip if it fails - non-critical)
+      try {
+        await (supabase.from('activity_logs') as any).insert({
+          org_id: orgId,
+          user_id: user.id,
+          action: data.id ? 'record.update' : 'record.create',
+          entity_type: 'daily_sales_log',
+          entity_id: logId,
+          entity_name: `${data.shopCode} - ${data.logDate}`,
+          shop_id: data.shopId,
+          metadata: {
+            total_sales: data.totalSales,
+            total_expenses: data.totalExpenses,
+            variance: data.cashRecon.difference,
+          },
+        });
+      } catch (activityError) {
+        console.warn('Activity log failed (non-critical):', activityError);
+      }
 
       return {
         success: true,
-        logId: logId!,
+        logId: logId,
         message: 'Saved successfully',
       };
     },
-    onSuccess: (_result, variables) => {
+    onSuccess: (result, variables) => {
       queryClient.invalidateQueries({ 
         queryKey: ['daily-register', variables.shopId, variables.logDate] 
       });
@@ -387,14 +502,14 @@ export function useExpenseSuggestions() {
         .select('description')
         .not('description', 'is', null)
         .order('created_at', { ascending: false })
-        .limit(100);
+        .limit(100)
+        .returns<{ description: string }[]>();
 
       if (error) throw error;
 
-      // Get unique values using Array.from instead of spread
       const descriptions = (data || [])
-        .map((e: any) => e.description)
-        .filter((d: any): d is string => Boolean(d));
+        .map(e => e.description)
+        .filter((d): d is string => Boolean(d));
       
       const unique = Array.from(new Set(descriptions));
       return unique.slice(0, 50);
