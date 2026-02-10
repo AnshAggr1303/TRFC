@@ -1,4 +1,3 @@
-// src/hooks/use-daily-register.ts
 'use client';
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -39,13 +38,18 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
         .limit(1)
         .returns<{ actual_closing: number | null }[]>();
 
-      const openingCash = prevLogArray?.[0]?.actual_closing ?? 0;
+      const previousDayClosing = prevLogArray?.[0]?.actual_closing;
+      const hasNoPreviousData = previousDayClosing === undefined || previousDayClosing === null;
+      
+      // Opening cash: use previous day's closing, or 0 if no previous data
+      const openingCash = previousDayClosing ?? 0;
 
       // 3. If no existing log, return empty data with opening cash
       if (!existingLog) {
         const emptyData = createEmptyRegisterData(shopId, shopCode, shopName, logDate);
         emptyData.cashRecon.openingCash = openingCash;
         emptyData.cashRecon.expectedCash = openingCash;
+        emptyData.cashRecon.isOpeningEditable = hasNoPreviousData; // Allow manual entry if no previous data
         return emptyData;
       }
 
@@ -158,8 +162,16 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
       const totalOnlineExpenses = onlineExpenses.reduce((sum, e) => sum + e.amount, 0);
       const totalExpenses = totalCashExpenses + totalOnlineExpenses;
 
-      const expectedCash = openingCash + cashSales - totalCashExpenses;
+      // Use stored opening cash from the log (may have been manually entered)
+      const storedOpeningCash = existingLog.opening_cash ?? openingCash;
+      const expectedCash = storedOpeningCash + cashSales - totalCashExpenses;
       const actualCash = existingLog.actual_closing || 0;
+
+      // ✅ CORRECT FORMULA: Difference = Actual - Expected
+      // Positive = Excess (more cash than expected)
+      // Negative = Short (less cash than expected)
+      // Zero = Matched
+      const difference = actualCash - expectedCash;
 
       // 9. Return complete data
       return {
@@ -168,7 +180,7 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
         shopCode,
         shopName,
         logDate,
-        status: existingLog.status || 'draft',
+        status: (existingLog.status === 'locked' ? 'draft' : existingLog.status) || 'draft',
 
         sales,
         totalSales,
@@ -180,15 +192,15 @@ export function useDailyRegister(shopId: string, shopCode: string, shopName: str
         totalExpenses,
 
         cashRecon: {
-          openingCash,
+          openingCash: storedOpeningCash,
           todaysCash: cashSales,
           todaysExpense: totalCashExpenses,
           expectedCash,
           actualCash,
-          difference: expectedCash - actualCash,
+          difference, // ✅ Now correctly: AC - EC
+          isOpeningEditable: hasNoPreviousData,
         },
 
-        managerName: existingLog.notes || '',
         lastSavedAt: existingLog.updated_at || undefined,
       };
     },
@@ -211,6 +223,14 @@ interface ProfileWithOrg {
   org_id: string | null;
 }
 
+// Profile with role for audit logging
+interface ProfileWithRole {
+  org_id: string | null;
+  name: string | null;
+  role_id: string | null;
+  roles: { name: string } | null;
+}
+
 export function useSaveDailyRegister() {
   const supabase = createClient();
   const queryClient = useQueryClient();
@@ -222,22 +242,25 @@ export function useSaveDailyRegister() {
       const user = authData?.user;
       if (!user) throw new Error('Not authenticated');
 
-      // Get user's org_id from profile - use explicit typing
+      // Get user's org_id and role from profile for audit logging
       const { data: profileData, error: profileError } = await supabase
         .from('profiles')
-        .select('org_id')
+        .select('org_id, name, role_id, roles(name)')
         .eq('id', user.id)
-        .single<ProfileWithOrg>();
+        .single<ProfileWithRole>();
 
       if (profileError) throw profileError;
       if (!profileData?.org_id) throw new Error('User has no organization');
 
       const orgId = profileData.org_id;
+      const userName = profileData.name || user.email || 'Unknown';
+      const userRole = (profileData.roles as { name: string } | null)?.name || 'Unknown';
+
+      // ✅ CORRECT FORMULA for variance: Actual - Expected
+      const variance = data.cashRecon.actualCash - data.cashRecon.expectedCash;
 
       // 1. Upsert daily_sales_logs
-      type DailySalesLogInsert = Database['public']['Tables']['daily_sales_logs']['Insert'];
-      
-      const logPayload: DailySalesLogInsert = {
+      const logPayload = {
         org_id: orgId,
         shop_id: data.shopId,
         log_date: data.logDate,
@@ -249,13 +272,13 @@ export function useSaveDailyRegister() {
         total_online_expenses: data.totalOnlineExpenses,
         expected_closing: data.cashRecon.expectedCash,
         actual_closing: data.cashRecon.actualCash,
-        variance: data.cashRecon.difference,
+        variance: variance, // ✅ Correct: AC - EC
         status: data.status,
-        notes: data.managerName,
         logged_by: user.id,
       };
 
       let logId: string;
+      const isUpdate = !!data.id;
 
       if (data.id) {
         // Update existing
@@ -453,20 +476,34 @@ export function useSaveDailyRegister() {
         await createExpenseWithPayment(expense, false);
       }
 
-      // 4. Log activity (skip if it fails - non-critical)
+      // 4. ✅ ENHANCED AUDIT LOGGING - replaces manual Name/Signature
       try {
         await (supabase.from('activity_logs') as any).insert({
           org_id: orgId,
           user_id: user.id,
-          action: data.id ? 'record.update' : 'record.create',
+          action: isUpdate ? 'record.update' : 'record.create',
           entity_type: 'daily_sales_log',
           entity_id: logId,
           entity_name: `${data.shopCode} - ${data.logDate}`,
           shop_id: data.shopId,
           metadata: {
+            // ✅ Auto-captured user info (replaces Name/Signature)
+            filled_by_name: userName,
+            filled_by_role: userRole,
+            filled_by_email: user.email,
+            timestamp: new Date().toISOString(),
+            action_type: isUpdate ? 'edited' : 'created',
+            
+            // Business data
             total_sales: data.totalSales,
             total_expenses: data.totalExpenses,
-            variance: data.cashRecon.difference,
+            cash_sales: data.cashRecon.todaysCash,
+            cash_expenses: data.cashRecon.todaysExpense,
+            opening_cash: data.cashRecon.openingCash,
+            expected_cash: data.cashRecon.expectedCash,
+            actual_cash: data.cashRecon.actualCash,
+            variance: variance,
+            variance_type: variance > 0 ? 'excess' : variance < 0 ? 'short' : 'matched',
           },
         });
       } catch (activityError) {
