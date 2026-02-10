@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback } from 'react';
-import { Plus, Trash2, Banknote, CreditCard, Wallet } from 'lucide-react';
+import { Plus, Trash2, Banknote, CreditCard, Wallet, Info } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { EditableCell } from '@/components/ui/editable-cell';
 import { useExpenseSuggestions } from '@/hooks/use-daily-register';
@@ -46,11 +46,16 @@ export function MainSheet({ data, onChange, isEditable }: MainSheetProps) {
     const todaysCash = updatedSales.find(r => r.id === 'cash')?.amount || 0;
     
     // Recalculate cash reconciliation
+    const expectedCash = data.cashRecon.openingCash + todaysCash - data.cashRecon.todaysExpense;
+    
+    // ✅ CORRECT: Difference = Actual - Expected
+    const difference = data.cashRecon.actualCash - expectedCash;
+    
     const cashRecon = {
       ...data.cashRecon,
       todaysCash,
-      expectedCash: data.cashRecon.openingCash + todaysCash - data.cashRecon.todaysExpense,
-      difference: (data.cashRecon.openingCash + todaysCash - data.cashRecon.todaysExpense) - data.cashRecon.actualCash,
+      expectedCash,
+      difference,
     };
     
     onChange({ sales: updatedSales, totalSales, cashRecon });
@@ -85,11 +90,16 @@ export function MainSheet({ data, onChange, isEditable }: MainSheetProps) {
     
     // Update cash reconciliation if cash expense changed
     if (isCash) {
+      const expectedCash = data.cashRecon.openingCash + data.cashRecon.todaysCash - total;
+      
+      // ✅ CORRECT: Difference = Actual - Expected
+      const difference = data.cashRecon.actualCash - expectedCash;
+      
       updates.cashRecon = {
         ...data.cashRecon,
         todaysExpense: total,
-        expectedCash: data.cashRecon.openingCash + data.cashRecon.todaysCash - total,
-        difference: (data.cashRecon.openingCash + data.cashRecon.todaysCash - total) - data.cashRecon.actualCash,
+        expectedCash,
+        difference,
       };
     }
     
@@ -124,11 +134,16 @@ export function MainSheet({ data, onChange, isEditable }: MainSheetProps) {
     };
     
     if (isCash) {
+      const expectedCash = data.cashRecon.openingCash + data.cashRecon.todaysCash - total;
+      
+      // ✅ CORRECT: Difference = Actual - Expected
+      const difference = data.cashRecon.actualCash - expectedCash;
+      
       updates.cashRecon = {
         ...data.cashRecon,
         todaysExpense: total,
-        expectedCash: data.cashRecon.openingCash + data.cashRecon.todaysCash - total,
-        difference: (data.cashRecon.openingCash + data.cashRecon.todaysCash - total) - data.cashRecon.actualCash,
+        expectedCash,
+        difference,
       };
     }
     
@@ -139,14 +154,70 @@ export function MainSheet({ data, onChange, isEditable }: MainSheetProps) {
   // CASH RECONCILIATION HANDLERS
   // ============================================
   
-  const handleActualCashChange = useCallback((value: number) => {
+  const handleOpeningCashChange = useCallback((value: number) => {
+    const expectedCash = value + data.cashRecon.todaysCash - data.cashRecon.todaysExpense;
+    
+    // ✅ CORRECT: Difference = Actual - Expected
+    const difference = data.cashRecon.actualCash - expectedCash;
+    
     const cashRecon = {
       ...data.cashRecon,
-      actualCash: value,
-      difference: data.cashRecon.expectedCash - value,
+      openingCash: value,
+      expectedCash,
+      difference,
     };
     onChange({ cashRecon });
   }, [data, onChange]);
+  
+  const handleActualCashChange = useCallback((value: number) => {
+    // ✅ CORRECT: Difference = Actual - Expected
+    const difference = value - data.cashRecon.expectedCash;
+    
+    const cashRecon = {
+      ...data.cashRecon,
+      actualCash: value,
+      difference,
+    };
+    onChange({ cashRecon });
+  }, [data, onChange]);
+
+  // ============================================
+  // DIFFERENCE DISPLAY HELPER
+  // ============================================
+  
+  // ✅ CORRECT INTERPRETATION:
+  // Difference = Actual - Expected
+  // Positive (+) = EXCESS (more cash in drawer than expected)
+  // Negative (-) = SHORT (less cash in drawer than expected)
+  // Zero = MATCHED
+  
+  const getDifferenceDisplay = () => {
+    const diff = data.cashRecon.difference;
+    
+    if (diff === 0) {
+      return {
+        text: '✓ Matched',
+        color: 'text-green-700',
+        bgColor: 'bg-green-50 dark:bg-green-950',
+      };
+    } else if (diff > 0) {
+      // Actual > Expected = EXCESS
+      return {
+        text: `₹${Math.abs(diff).toLocaleString('en-IN')} (Excess)`,
+        color: 'text-amber-700',
+        bgColor: 'bg-amber-50 dark:bg-amber-950',
+      };
+    } else {
+      // Actual < Expected = SHORT
+      return {
+        text: `₹${Math.abs(diff).toLocaleString('en-IN')} (Short)`,
+        color: 'text-red-700',
+        bgColor: 'bg-red-50 dark:bg-red-950',
+      };
+    }
+  };
+
+  const differenceDisplay = getDifferenceDisplay();
 
   // ============================================
   // RENDER
@@ -226,10 +297,29 @@ export function MainSheet({ data, onChange, isEditable }: MainSheetProps) {
             </div>
             <table className="w-full">
               <tbody>
+                {/* Opening Cash - editable if no previous data */}
                 <tr className="border-b">
-                  <td className="px-4 py-2 text-sm">Opening Cash</td>
-                  <td className="px-4 py-2 text-right text-sm font-medium">
-                    ₹{data.cashRecon.openingCash.toLocaleString('en-IN')}
+                  <td className="px-4 py-2 text-sm">
+                    Opening Cash
+                    {data.cashRecon.isOpeningEditable && (
+                      <span className="text-xs text-amber-600 ml-2">(First entry - enter manually)</span>
+                    )}
+                  </td>
+                  <td className="p-0">
+                    {data.cashRecon.isOpeningEditable && isEditable ? (
+                      <EditableCell
+                        value={data.cashRecon.openingCash}
+                        onChange={(val) => handleOpeningCashChange(Number(val))}
+                        type="number"
+                        placeholder="0"
+                        disabled={!isEditable}
+                        className="text-sm font-medium"
+                      />
+                    ) : (
+                      <span className="px-4 py-2 text-right text-sm font-medium block">
+                        ₹{data.cashRecon.openingCash.toLocaleString('en-IN')}
+                      </span>
+                    )}
                   </td>
                 </tr>
                 <tr className="border-b">
@@ -263,31 +353,25 @@ export function MainSheet({ data, onChange, isEditable }: MainSheetProps) {
                     />
                   </td>
                 </tr>
-                <tr className={cn(
-                  "font-bold",
-                  data.cashRecon.difference === 0 
-                    ? "bg-green-50 dark:bg-green-950" 
-                    : data.cashRecon.difference < 0 
-                      ? "bg-red-50 dark:bg-red-950" 
-                      : "bg-amber-50 dark:bg-amber-950"
-                )}>
-                  <td className="px-4 py-2">Difference (EC - AC)</td>
-                  <td className={cn(
-                    "px-4 py-2 text-right",
-                    data.cashRecon.difference === 0 
-                      ? "text-green-700" 
-                      : data.cashRecon.difference < 0 
-                        ? "text-red-700" 
-                        : "text-amber-700"
-                  )}>
-                    {data.cashRecon.difference === 0 
-                      ? '✓ Matched' 
-                      : `₹${Math.abs(data.cashRecon.difference).toLocaleString('en-IN')} ${data.cashRecon.difference < 0 ? '(Short)' : '(Excess)'}`
-                    }
+                {/* ✅ CORRECTED Difference Display */}
+                <tr className={cn("font-bold", differenceDisplay.bgColor)}>
+                  <td className="px-4 py-2">
+                    Difference (AC − EC)
+                  </td>
+                  <td className={cn("px-4 py-2 text-right", differenceDisplay.color)}>
+                    {differenceDisplay.text}
                   </td>
                 </tr>
               </tbody>
             </table>
+            
+            {/* Formula explanation tooltip */}
+            <div className="px-4 py-2 bg-muted/30 text-xs text-muted-foreground flex items-center gap-1">
+              <Info className="h-3 w-3" />
+              <span>
+                AC &gt; EC = Excess • AC &lt; EC = Short • AC = EC = Matched
+              </span>
+            </div>
           </div>
         </div>
 
@@ -473,24 +557,15 @@ export function MainSheet({ data, onChange, isEditable }: MainSheetProps) {
         </div>
       </div>
 
-      {/* Signature Row */}
-      <div className="mt-6 pt-4 border-t grid grid-cols-2 gap-8">
-        <div>
-          <label className="text-sm text-muted-foreground">Name</label>
-          <EditableCell
-            value={data.managerName}
-            onChange={(val) => onChange({ managerName: String(val) })}
-            type="text"
-            placeholder="Enter name..."
-            disabled={!isEditable}
-            className="border-b border-dashed mt-1"
-          />
+      {/* ✅ REMOVED Name/Signature Section - Audit is automatic via logged-in user */}
+      {/* Auto-captured metadata shown in footer instead */}
+      {data.lastSavedAt && (
+        <div className="mt-6 pt-4 border-t text-center text-xs text-muted-foreground">
+          <span>Last saved: {new Date(data.lastSavedAt).toLocaleString('en-IN')}</span>
+          <span className="mx-2">•</span>
+          <span>All changes are automatically logged with user identity</span>
         </div>
-        <div>
-          <label className="text-sm text-muted-foreground">Signature</label>
-          <div className="border-b border-dashed mt-1 h-8"></div>
-        </div>
-      </div>
+      )}
     </div>
   );
 }
